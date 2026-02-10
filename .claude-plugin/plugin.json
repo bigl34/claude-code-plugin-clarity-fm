@@ -1,0 +1,5 @@
+{
+  "name": "clarity-fm-manager",
+  "version": "1.2.3",
+  "description": "Find and book expert calls on Clarity.fm via CLI-based browser automation (zero context overhead)"
+}
