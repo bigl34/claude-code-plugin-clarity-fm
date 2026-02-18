@@ -30,7 +30,7 @@ const __dirname = dirname(__filename);
 // Paths
 const SESSION_PATH = "/tmp/clarity-session.json";
 const STORAGE_STATE_PATH = "/tmp/clarity-storage-state.json";
-const SCREENSHOT_DIR = "/home/USER/biz/.playwright-mcp";
+const SCREENSHOT_DIR = "/Users/USER/biz/.playwright-mcp";
 const CONFIG_PATH = join(__dirname, "..", "config.json");
 const USER_DATA_DIR = "/tmp/clarity-browser-profile";
 
