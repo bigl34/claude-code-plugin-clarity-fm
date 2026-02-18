@@ -17,10 +17,10 @@ Find, evaluate, and book paid consultation calls with business experts on Clarit
 Run commands using Bash. **Browser commands require `xvfb-run`** (WSL has no X display):
 ```bash
 # Browser commands (search, view, compare, fill, submit, list, screenshot):
-xvfb-run --auto-servernum node /home/USER/.claude/plugins/local-marketplace/clarity-fm-manager/scripts/dist/cli.js <command> [options]
+xvfb-run --auto-servernum node /Users/USER/.claude/plugins/local-marketplace/clarity-fm-manager/scripts/dist/cli.js <command> [options]
 
 # Local commands (budget-status, set-budget, reset) — no xvfb needed:
-node /home/USER/.claude/plugins/local-marketplace/clarity-fm-manager/scripts/dist/cli.js <command> [options]
+node /Users/USER/.claude/plugins/local-marketplace/clarity-fm-manager/scripts/dist/cli.js <command> [options]
 ```
 
 **Search note:** Clarity.fm uses category-based browsing, not keyword search. Queries are mapped to browse categories (e.g., "ecommerce" → `/browse/industries/e-commerce`, "marketing" → `/browse/sales-marketing`). Generic queries default to the featured experts page.
@@ -128,7 +128,7 @@ Ask the user what kind of expert they need:
 ### Step 2: Search for Experts
 
 ```bash
-node /home/USER/.claude/plugins/local-marketplace/clarity-fm-manager/scripts/dist/cli.js search-experts \
+node /Users/USER/.claude/plugins/local-marketplace/clarity-fm-manager/scripts/dist/cli.js search-experts \
   --query "marketing strategy" \
   --max-rate 10 \
   --limit 10
@@ -170,7 +170,7 @@ Report current spend and remaining budget.
 Before proposing booking times, check Google Calendar for conflicts by calling the google-workspace-manager CLI directly:
 
 ```bash
-node /home/USER/.claude/plugins/local-marketplace/google-workspace-manager/scripts/dist/cli.js get-events \
+node /Users/USER/.claude/plugins/local-marketplace/google-workspace-manager/scripts/dist/cli.js get-events \
   --time-min "{date}T00:00:00Z" --time-max "{date}T23:59:59Z"
 ```
 
@@ -331,6 +331,6 @@ For other operations, suggest:
 - **Task management**: clickup-task-manager
 
 ## Self-Documentation
-Log API quirks/errors to: `/home/USER/biz/plugin-learnings/clarity-fm-manager.md`
+Log API quirks/errors to: `/Users/USER/biz/plugin-learnings/clarity-fm-manager.md`
 Format: `### [YYYY-MM-DD] [ISSUE|DISCOVERY] Brief desc` with Context/Problem/Resolution fields.
 Full workflow: `~/biz/docs/reference/agent-shared-context.md`
