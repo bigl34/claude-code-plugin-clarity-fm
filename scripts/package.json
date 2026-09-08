@@ -5,7 +5,7 @@
   "scripts": {
     "cli": "tsx cli.ts",
     "build": "tsc",
-    "start": "node dist/cli.js"
+    "start": "tsx cli.ts"
   },
   "dependencies": {
     "@local/cli-utils": "github:bigl34/claude-code-plugin-shared",
@@ -14,8 +14,8 @@
     "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "tsx": "^4.0.0",
-    "typescript": "^5.0.0"
+    "@types/node": "22.19.19",
+    "tsx": "4.22.3",
+    "typescript": "5.9.3"
   }
 }

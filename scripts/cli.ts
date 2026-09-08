@@ -1,15 +1,9 @@
 #!/usr/bin/env npx tsx
-/**
- * Clarity.fm Manager CLI
- *
- * Zod-validated CLI for finding and booking expert calls on Clarity.fm.
- */
 
 import { z, createCommand, runCli, cliTypes } from "@local/cli-utils";
 import { ClarityClient } from "./clarity-client.js";
 import { BudgetTracker } from "./budget-tracker.js";
 
-// Budget tracker is standalone (no browser needed)
 const budgetTracker = new BudgetTracker();
 
 const commands = {
@@ -34,7 +28,8 @@ const commands = {
         enrich: args.enrich,
       });
     },
-    "Search for experts by keyword with rate/sort filters"
+    "Search for experts by keyword with rate/sort filters",
+    { sideEffect: "read" }
   ),
 
   "view-profile": createCommand(
@@ -44,7 +39,8 @@ const commands = {
     async (args: any, client: ClarityClient) => {
       return client.viewProfile({ expert: args.expert });
     },
-    "View detailed expert profile with value scoring"
+    "View detailed expert profile with value scoring",
+    { sideEffect: "read" }
   ),
 
   "compare-experts": createCommand(
@@ -54,7 +50,8 @@ const commands = {
     async (args: any, client: ClarityClient) => {
       return client.compareExperts({ experts: args.experts });
     },
-    "Side-by-side comparison of 2-3 experts with value scoring"
+    "Side-by-side comparison of 2-3 experts with value scoring",
+    { sideEffect: "read" }
   ),
 
   "fill-booking": createCommand(
@@ -78,7 +75,8 @@ const commands = {
         phone: args.phone,
       });
     },
-    "Fill booking form (does NOT submit — two-stage confirmation)"
+    "Fill booking form (does NOT submit — two-stage confirmation)",
+    { sideEffect: "write" }
   ),
 
   "submit-booking": createCommand(
@@ -86,7 +84,8 @@ const commands = {
     async (_args: any, client: ClarityClient) => {
       return client.submitBooking();
     },
-    "Submit the filled booking form (after user confirmation)"
+    "Compatibility command that refuses automated submission and requires manual completion",
+    { sideEffect: "external_send", requiresConfirmation: true }
   ),
 
   "list-calls": createCommand(
@@ -96,7 +95,8 @@ const commands = {
     async (args: any, client: ClarityClient) => {
       return client.listCalls({ status: args.status });
     },
-    "View calls from dashboard"
+    "View calls from dashboard",
+    { sideEffect: "read" }
   ),
 
   "budget-status": createCommand(
@@ -106,7 +106,8 @@ const commands = {
     async (args: any) => {
       return budgetTracker.getStatus(args.month);
     },
-    "Show monthly spend and remaining budget"
+    "Show monthly spend and remaining budget",
+    { sideEffect: "read" }
   ),
 
   "set-budget": createCommand(
@@ -116,7 +117,8 @@ const commands = {
     async (args: any) => {
       return budgetTracker.setBudget(args.monthly);
     },
-    "Set monthly spending cap (USD)"
+    "Set monthly spending cap (USD)",
+    { sideEffect: "write" }
   ),
 
   "screenshot": createCommand(
@@ -130,13 +132,15 @@ const commands = {
         fullPage: args.fullPage,
       });
     },
-    "Take screenshot of current browser page"
+    "Take screenshot of current browser page",
+    { sideEffect: "read" }
   ),
 
   "reset": createCommand(
     z.object({}),
     async (_args: any, client: ClarityClient) => client.reset(),
-    "Close browser and clear session"
+    "Close browser and clear session",
+    { sideEffect: "destructive" }
   ),
 };
 

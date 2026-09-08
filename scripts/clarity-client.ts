@@ -1,61 +1,81 @@
-/**
- * Clarity.fm Browser Automation Client
- *
- * Automates expert search, profile viewing, and booking on Clarity.fm.
- * The official API (github.com/clarityfm/clarity-api) is non-functional,
- * so all interactions use Playwright browser automation.
- *
- * Key features:
- * - Search: Find experts by keyword with rate/sort filters
- * - Profile: Extract detailed expert data with value scoring
- * - Compare: Side-by-side expert comparison
- * - Fill Booking: Pre-fill booking form (two-stage confirmation)
- * - Dashboard: View upcoming/completed calls
- *
- * Uses headed browser with stealth plugin. Clarity.fm is a JavaScript SPA
- * with analytics tracking; payment flows may have anti-fraud checks.
- */
 
 import { chromium } from "playwright-extra";
+import type { Browser, BrowserContext, BrowserContextOptions, Page } from "playwright";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from "fs";
-import { dirname, join } from "path";
-import { fileURLToPath } from "url";
+import { existsSync, readFileSync, unlinkSync, mkdirSync } from "fs";
+import { loadServiceConfig, z } from "@local/cli-utils";
+import { secureStatePath, secureWrite } from "./vendor/secure-state/index.js";
+import { BudgetTracker } from "./budget-tracker.js";
 
 chromium.use(StealthPlugin());
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-// Paths
-const SESSION_PATH = "/tmp/clarity-session.json";
-const STORAGE_STATE_PATH = "/tmp/clarity-storage-state.json";
+const SESSION_PATH = secureStatePath("clarity-fm", "session.json");
+const STORAGE_STATE_PATH = secureStatePath("clarity-fm", "storage-state.json");
 const SCREENSHOT_DIR = process.env.HOME + "/biz/.playwright-mcp";
-const CONFIG_PATH = join(__dirname, "..", "config.json");
-const USER_DATA_DIR = "/tmp/clarity-browser-profile";
+const USER_DATA_DIR = secureStatePath("clarity-fm", "browser-profile");
 
-// Clarity.fm URLs
+const ClarityConfigSchema = z.object({
+  clarity: z.object({
+    email: z.string().min(1),
+    password: z.string().min(1),
+    phone: z.string().min(1),
+    monthlyBudget: z.number().optional(),
+  }),
+});
+
 const CLARITY_BASE = "https://clarity.fm";
 const CLARITY_LOGIN_URL = `${CLARITY_BASE}/login`;
 const CLARITY_DASHBOARD_URL = `${CLARITY_BASE}/dashboard`;
 
-// Interfaces
 
 interface SessionInfo {
-  wsEndpoint: string;
+  wsEndpoint?: string;
   createdAt: string;
   loggedIn: boolean;
   bookingFilled: boolean;
   currentExpert?: string;
+  currentDuration?: number;
+  currentCostPerMinute?: number;
+  currentEstimatedCost?: number;
 }
 
-interface Config {
-  clarity: {
-    email: string;
-    password: string;
-    phone: string;
-    monthlyBudget?: number;
-  };
+type Config = z.infer<typeof ClarityConfigSchema>;
+
+export interface BookingConfirmationDetails {
+  clarityCallId?: string | null;
+  scheduledAt?: string | null;
+  dialInNumber?: string | null;
+  estimatedTotal?: number | null;
+  pageText?: string | null;
+  pageUrl?: string | null;
+}
+
+export function hasBookingConfirmationSignal(confirmation: BookingConfirmationDetails): boolean {
+  if (confirmation.clarityCallId || confirmation.scheduledAt || confirmation.dialInNumber) {
+    return true;
+  }
+
+  const text = `${confirmation.pageText ?? ""} ${confirmation.pageUrl ?? ""}`.toLowerCase();
+  if (/\b(confirmed|booking request sent|request received|scheduled|call booked|thank you)\b/.test(text)) {
+    return true;
+  }
+
+  return /\/(?:calls|bookings|requests)\/(?:confirmation|confirmed|[a-z0-9-]{6,})/i.test(confirmation.pageUrl ?? "");
+}
+
+export function parseClarityRate(rateText: string): number | null {
+  const perMinute = rateText.match(/\$\s*([0-9]+(?:\.[0-9]+)?)\s*(?:\/\s*min|per\s*(?:min|minute))/i);
+  if (perMinute) {
+    return Number.parseFloat(perMinute[1]);
+  }
+
+  const bareCurrency = rateText.trim().match(/^\$\s*([0-9]+(?:\.[0-9]+)?)$/);
+  if (bareCurrency) {
+    return Number.parseFloat(bareCurrency[1]);
+  }
+
+  const numericOnly = rateText.trim().match(/^([0-9]+(?:\.[0-9]+)?)$/);
+  return numericOnly ? Number.parseFloat(numericOnly[1]) : null;
 }
 
 export interface ExpertProfile {
@@ -117,11 +137,16 @@ interface ScreenshotOptions {
   fullPage?: boolean;
 }
 
+type BrowserWithOptionalEndpoint = Browser & {
+  wsEndpoint?: () => string;
+};
+
 export class ClarityClient {
   private config: Config;
-  private browser: any = null;
-  private context: any = null;
-  private page: any = null;
+  private budgetTracker = new BudgetTracker();
+  private browser: Browser | null = null;
+  private context: BrowserContext | null = null;
+  private page: Page | null = null;
 
   constructor() {
     this.config = this.loadConfig();
@@ -130,50 +155,46 @@ export class ClarityClient {
     }
   }
 
-  // ============================================
-  // INTERNAL: Config & Session
-  // ============================================
 
   private loadConfig(): Config {
-    if (!existsSync(CONFIG_PATH)) {
-      throw new Error(`Config file not found at ${CONFIG_PATH}. Set up credentials via cred-loader.`);
-    }
-    return JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+    return loadServiceConfig("clarity-fm-manager", {
+      schema: ClarityConfigSchema,
+      remedy: "Set up credentials via cred-loader.",
+    });
   }
 
-  private async ensureBrowser(): Promise<any> {
+  private async ensureBrowser(): Promise<Page> {
     if (!existsSync(USER_DATA_DIR)) {
       mkdirSync(USER_DATA_DIR, { recursive: true });
     }
 
-    // Try to reconnect to existing session
     if (existsSync(SESSION_PATH)) {
       try {
         const session: SessionInfo = JSON.parse(readFileSync(SESSION_PATH, "utf-8"));
-        this.browser = await chromium.connectOverCDP(session.wsEndpoint);
-        const contexts = this.browser.contexts();
-        if (contexts.length > 0) {
-          this.context = contexts[0];
-          const pages = this.context.pages();
-          if (pages.length > 0) {
-            this.page = pages[0];
-            return this.page;
+        if (session.wsEndpoint) {
+          this.browser = await chromium.connectOverCDP(session.wsEndpoint);
+          const contexts = this.browser.contexts();
+          if (contexts.length > 0) {
+            this.context = contexts[0];
+            const pages = this.context.pages();
+            if (pages.length > 0) {
+              this.page = pages[0];
+              return this.page;
+            }
           }
         }
       } catch {
-        try { unlinkSync(SESSION_PATH); } catch { /* ignore */ }
+        try { unlinkSync(SESSION_PATH); } catch {   }
       }
     }
 
-    // Clean WSL2 singleton locks
     for (const file of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
       const filePath = `${USER_DATA_DIR}/${file}`;
       if (existsSync(filePath)) {
-        try { unlinkSync(filePath); } catch { /* ignore */ }
+        try { unlinkSync(filePath); } catch {   }
       }
     }
 
-    // Launch with stealth
     this.browser = await chromium.launch({
       headless: false,
       args: [
@@ -184,42 +205,49 @@ export class ClarityClient {
       ],
     });
 
-    // Restore storage state if available (cookies, localStorage)
-    const contextOptions: any = {
+    const contextOptions: BrowserContextOptions = {
       viewport: { width: 1280, height: 800 },
     };
     if (existsSync(STORAGE_STATE_PATH)) {
       try {
         contextOptions.storageState = STORAGE_STATE_PATH;
-      } catch { /* ignore invalid state */ }
+      } catch {   }
     }
 
     this.context = await this.browser.newContext(contextOptions);
     this.page = await this.context.newPage();
 
-    // Save session for reconnection
-    const wsEndpoint = (this.browser as any)?.wsEndpoint?.() as string | undefined;
-    if (wsEndpoint) {
-      writeFileSync(
-        SESSION_PATH,
-        JSON.stringify({
-          wsEndpoint,
-          createdAt: new Date().toISOString(),
-          loggedIn: false,
-          bookingFilled: false,
-        } as SessionInfo)
-      );
-    }
+    const wsEndpoint = this.browserWsEndpoint();
+    secureWrite(
+      SESSION_PATH,
+      JSON.stringify({
+        wsEndpoint,
+        createdAt: new Date().toISOString(),
+        loggedIn: false,
+        bookingFilled: false,
+      } as SessionInfo)
+    );
 
     return this.page;
   }
 
+  private browserWsEndpoint(): string | undefined {
+    const endpoint = (this.browser as BrowserWithOptionalEndpoint | null)?.wsEndpoint?.();
+    return typeof endpoint === "string" && endpoint.length > 0 ? endpoint : undefined;
+  }
+
   private updateSession(updates: Partial<SessionInfo>): void {
-    if (existsSync(SESSION_PATH)) {
-      const session = JSON.parse(readFileSync(SESSION_PATH, "utf-8"));
-      Object.assign(session, updates);
-      writeFileSync(SESSION_PATH, JSON.stringify(session));
-    }
+    const existing = this.getSession();
+    const wsEndpoint = existing?.wsEndpoint ?? this.browserWsEndpoint();
+    const session: SessionInfo = {
+      wsEndpoint,
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      loggedIn: existing?.loggedIn ?? false,
+      bookingFilled: existing?.bookingFilled ?? false,
+      ...existing,
+      ...updates,
+    };
+    secureWrite(SESSION_PATH, JSON.stringify(session));
   }
 
   private getSession(): SessionInfo | null {
@@ -235,18 +263,11 @@ export class ClarityClient {
     if (this.context) {
       try {
         await this.context.storageState({ path: STORAGE_STATE_PATH });
-      } catch { /* ignore */ }
+      } catch {   }
     }
   }
 
-  // ============================================
-  // INTERNAL: Query → Browse URL Mapping
-  // ============================================
 
-  /**
-   * Clarity.fm doesn't have keyword search — it uses category-based browsing
-   * at /browse/{category}/{subcategory}. Map common queries to the right URL.
-   */
   private queryToBrowseUrl(query: string): string {
     const q = query.toLowerCase().trim();
 
@@ -311,12 +332,10 @@ export class ClarityClient {
       "public speaking": "skills-management/public-speaking",
     };
 
-    // Exact match
     if (CATEGORY_MAP[q]) {
       return `${CLARITY_BASE}/browse/${CATEGORY_MAP[q]}`;
     }
 
-    // Partial match — longest matching key wins
     let bestMatch = "";
     let bestPath = "";
     for (const [key, path] of Object.entries(CATEGORY_MAP)) {
@@ -329,23 +348,13 @@ export class ClarityClient {
       return `${CLARITY_BASE}/browse/${bestPath}`;
     }
 
-    // Fallback: browse featured experts
     return `${CLARITY_BASE}/browse`;
   }
 
-  // ============================================
-  // INTERNAL: SPA Helpers
-  // ============================================
 
-  /**
-   * Wait for SPA content to render. Clarity.fm is a JS SPA that shows
-   * loading indicators while fetching data.
-   */
   private async waitForSPAContent(page: any, indicator: string, timeout = 15000): Promise<void> {
-    // Wait for any loading spinner to disappear
     await page.waitForSelector('text="Loading..."', { state: "hidden", timeout: 5000 }).catch(() => {});
     await page.waitForSelector('[class*="loading"], [class*="spinner"]', { state: "hidden", timeout: 5000 }).catch(() => {});
-    // Wait for our target content
     await page.waitForSelector(indicator, { timeout });
   }
 
@@ -360,7 +369,7 @@ export class ClarityClient {
         ).forEach(el => el.remove());
         document.body.style.overflow = "";
       });
-    } catch { /* ignore */ }
+    } catch {   }
 
     const cookieButtons = [
       'button:has-text("Accept All")',
@@ -382,28 +391,18 @@ export class ClarityClient {
     }
   }
 
-  /**
-   * Log failed network requests and console errors for debugging
-   * anti-bot detection or SPA failures.
-   */
   private setupTelemetry(page: any): void {
     page.on("console", (msg: any) => {
       if (msg.type() === "error") {
-        // Silently log — these get captured in screenshots
       }
     });
     page.on("requestfailed", (req: any) => {
       const url = req.url();
-      // Log API failures that could indicate blocks
       if (url.includes("clarity.fm") && !url.includes(".png") && !url.includes(".jpg")) {
-        // Silently noted — diagnosable from screenshots
       }
     });
   }
 
-  // ============================================
-  // INTERNAL: Login
-  // ============================================
 
   private async ensureLoggedIn(): Promise<any> {
     const page = await this.ensureBrowser();
@@ -411,16 +410,14 @@ export class ClarityClient {
 
     const session = this.getSession();
     if (session?.loggedIn) {
-      // Verify we're still logged in by checking the page
       try {
         await page.goto(CLARITY_DASHBOARD_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
         await page.waitForTimeout(3000);
-        // If we're redirected to login, we need to re-auth
         const url = page.url();
         if (!url.includes("login")) {
           return page;
         }
-      } catch { /* fall through to login */ }
+      } catch {   }
     }
 
     return this.login();
@@ -437,7 +434,6 @@ export class ClarityClient {
     const loginScreenshot = `${SCREENSHOT_DIR}/clarity-login-page-${Date.now()}.png`;
     await page.screenshot({ path: loginScreenshot, fullPage: true });
 
-    // Find email field (multi-variant selectors for SPA)
     const emailSelectors = [
       'input[name="email"]',
       'input[type="email"]',
@@ -464,7 +460,6 @@ export class ClarityClient {
 
     await emailField.fill(this.config.clarity.email);
 
-    // Find password field
     const passwordSelectors = [
       'input[type="password"]',
       'input[name="password"]',
@@ -480,7 +475,6 @@ export class ClarityClient {
     }
 
     if (!passwordField) {
-      // May be a two-step flow — click continue first
       const continueBtn = await page.$('button[type="submit"], button:has-text("Continue"), button:has-text("Next")');
       if (continueBtn) {
         await continueBtn.click({ force: true });
@@ -502,7 +496,6 @@ export class ClarityClient {
 
     await passwordField.fill(this.config.clarity.password);
 
-    // Click login
     const loginBtn = await page.$(
       'button[type="submit"], button:has-text("Log In"), button:has-text("Sign In"), ' +
       'button:has-text("Login"), input[type="submit"]'
@@ -511,7 +504,6 @@ export class ClarityClient {
       await loginBtn.click({ force: true });
     }
 
-    // Wait for redirect to dashboard or presence of logged-in indicator
     try {
       await Promise.race([
         page.waitForURL(/dashboard|home|clarity\.fm\/$/, { timeout: 30000 }),
@@ -532,15 +524,6 @@ export class ClarityClient {
     return page;
   }
 
-  // ============================================
-  // INTERNAL: Data Extraction
-  // ============================================
-
-  private parseRate(rateText: string): number {
-    // Parse "$5.00/min" or "$5/min" or "5.00" etc.
-    const match = rateText.match(/[\d.]+/);
-    return match ? parseFloat(match[0]) : 0;
-  }
 
   private calculateValueScore(reviewCount: number | null, rating: number | null, rate: number): number | null {
     if (rating === null || reviewCount === null) return null;
@@ -549,7 +532,6 @@ export class ClarityClient {
   }
 
   private normalizeUsername(expertInput: string): string {
-    // Accept full URL or just username
     if (expertInput.startsWith("http")) {
       const url = new URL(expertInput);
       return url.pathname.replace(/^\//, "").split("/")[0];
@@ -557,24 +539,21 @@ export class ClarityClient {
     return expertInput.replace(/^@/, "");
   }
 
-  // ============================================
-  // INTERNAL: Profile Enrichment
-  // ============================================
 
-  /**
-   * Fetch ratings from individual profile pages in parallel (max 3 concurrent tabs).
-   * Browse pages don't render star ratings, so we visit each profile to extract them.
-   */
   private async enrichProfiles(experts: ExpertProfile[]): Promise<ExpertProfile[]> {
     const MAX_CONCURRENT = 3;
     const enriched: ExpertProfile[] = [...experts];
+    const context = this.context;
+    if (!context) {
+      throw new Error("Browser context is not initialized.");
+    }
 
     for (let i = 0; i < enriched.length; i += MAX_CONCURRENT) {
       const batch = enriched.slice(i, i + MAX_CONCURRENT);
 
       const results = await Promise.allSettled(
         batch.map(async (expert) => {
-          const tab = await this.context.newPage();
+          const tab = await context.newPage();
           try {
             await tab.goto(`${CLARITY_BASE}/${expert.username}`, {
               waitUntil: "domcontentloaded",
@@ -585,7 +564,6 @@ export class ClarityClient {
             const profileData = await tab.evaluate(() => {
               const text = document.body.innerText;
 
-              // Rating — star pattern, validate 0-5 range
               let rating: number | null = null;
               const ratingMatches = text.matchAll(/([\d.]+)\s*(?:out of 5|stars?|★|\/5)/gi);
               for (const m of ratingMatches) {
@@ -593,7 +571,6 @@ export class ClarityClient {
                 if (val > 0 && val <= 5) { rating = val; break; }
               }
 
-              // Review count — "NNN Reviews/Ratings/Feedback"
               let reviewCount: number | null = null;
               const reviewMatch = text.match(/(\d[\d,]*)\s*\n?\s*(?:Reviews?|Ratings?|Feedback)/i);
               if (reviewMatch) {
@@ -610,7 +587,6 @@ export class ClarityClient {
         })
       );
 
-      // Apply results back to experts
       results.forEach((result, j) => {
         const idx = i + j;
         if (result.status === "fulfilled" && result.value) {
@@ -628,9 +604,6 @@ export class ClarityClient {
     return enriched;
   }
 
-  // ============================================
-  // PUBLIC: Search Experts
-  // ============================================
 
   async searchExperts(options: {
     query: string;
@@ -644,30 +617,26 @@ export class ClarityClient {
     const page = await this.ensureBrowser();
     this.setupTelemetry(page);
 
-    // Clarity.fm uses category-based browsing at /browse/{category}, not keyword search
     const browseUrl = this.queryToBrowseUrl(options.query);
     await page.goto(browseUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForTimeout(3000);
     await this.dismissCookieBanners(page);
 
-    // Handle sort — click sort links after page loads
     if (options.sort === "rate") {
       try {
         const sortLink = await page.$('a:has-text("Lowest Price")');
         if (sortLink) { await sortLink.click(); await page.waitForTimeout(2000); }
-      } catch { /* sort unavailable */ }
+      } catch {   }
     } else if (options.sort === "calls") {
       try {
         const popularLink = await page.$('a:has-text("Popular")');
         if (popularLink) { await popularLink.click(); await page.waitForTimeout(2000); }
-      } catch { /* filter unavailable */ }
+      } catch {   }
     }
 
-    // Wait for expert cards — they are list items containing "per minute"
     try {
       await this.waitForSPAContent(page, 'li', 15000);
     } catch {
-      // Page may have loaded but with no results
     }
 
     const screenshotPath = `${SCREENSHOT_DIR}/clarity-search-${Date.now()}.png`;
@@ -675,15 +644,11 @@ export class ClarityClient {
 
     const limit = Math.min(options.limit || 10, 20);
 
-    // Extract expert data from browse results
-    // Clarity.fm DOM: expert cards are <li> elements containing "per minute" + "Request a Call"
-    // Each card has: <strong>$rate</strong>, call count in "(NNN)", <strong>Name</strong>, bio text
     const experts = await page.evaluate((opts: { maxResults: number; minRate?: number; maxRate?: number }) => {
       const results: any[] = [];
       const NAV_PATHS = ["browse", "topics", "login", "search", "signup", "dashboard",
         "settings", "questions", "calls", "inbox", "help", "terms", "how-it-works", "customers"];
 
-      // Find expert cards — list items that contain rate and call-to-action
       const allItems = document.querySelectorAll("li");
       const cards = Array.from(allItems).filter(li => {
         const t = li.textContent || "";
@@ -694,7 +659,6 @@ export class ClarityClient {
         try {
           const text = card.textContent || "";
 
-          // Username from profile link (href="/username/expertise/..." or "/username")
           let username = "";
           const links = card.querySelectorAll('a[href^="/"]');
           for (const link of Array.from(links)) {
@@ -706,36 +670,26 @@ export class ClarityClient {
             }
           }
 
-          // Rate from first <strong> starting with "$"
           const strongEls = card.querySelectorAll("strong");
-          let rateNum = 0;
-          let rateDisplay = "N/A";
+          let rateDisplay = "";
           let name = "";
           for (const s of Array.from(strongEls)) {
             const sText = s.textContent?.trim() || "";
-            if (sText.startsWith("$") && rateNum === 0) {
-              rateNum = parseFloat(sText.replace(/[^0-9.]/g, "")) || 0;
-              rateDisplay = `${sText}/min`;
+            if (sText.startsWith("$") && !rateDisplay) {
+              rateDisplay = sText;
             } else if (!sText.startsWith("$") && sText.length > 1 && !name) {
               name = sText;
             }
           }
 
-          // Apply rate filters
-          if (opts.minRate && rateNum < opts.minRate) continue;
-          if (opts.maxRate && rateNum > opts.maxRate) continue;
-
-          // Call count from "(NNN)" pattern
           const callMatch = text.match(/\((\d[\d,]*)\)/);
           const totalCalls = callMatch ? parseInt(callMatch[1].replace(",", "")) : 0;
 
-          // Bio — find the longest text segment (>80 chars) that isn't the whole card
           let bio = "";
           const walker = document.createTreeWalker(card, NodeFilter.SHOW_ELEMENT);
           let node: Node | null;
           while ((node = walker.nextNode())) {
             const el = node as HTMLElement;
-            // Only look at leaf-ish containers (those without many child elements)
             if (el.children.length <= 2 && el.childNodes.length > 0) {
               const t = el.textContent?.trim() || "";
               if (t.length > 80 && t.length > bio.length && !t.includes("Request a Call")) {
@@ -745,13 +699,12 @@ export class ClarityClient {
           }
 
           if (name || username) {
-            // Clean bio: collapse whitespace and remove DOM artifacts
             const cleanBio = bio.replace(/\s+/g, " ").replace(/Created \d+ \w+ ago/i, "").trim();
             results.push({
               name: name || username,
               username,
               url: `https://clarity.fm/${username}`,
-              rate: rateNum,
+              rate: 0,
               rateDisplay,
               bio: cleanBio.substring(0, 200),
               expertise: [],
@@ -762,34 +715,45 @@ export class ClarityClient {
               availability: "",
             });
           }
-        } catch { /* skip broken cards */ }
+        } catch {   }
       }
 
       return results;
-    }, { maxResults: limit, minRate: options.minRate, maxRate: options.maxRate });
+    }, { maxResults: limit });
 
-    // Calculate value scores (will be null for unenriched experts)
-    for (const expert of experts) {
+    const normalizedExperts = experts
+      .map((expert: ExpertProfile) => {
+        const rate = parseClarityRate(expert.rateDisplay || "");
+        return {
+          ...expert,
+          rate: rate ?? 0,
+          rateDisplay: rate === null ? "N/A" : `$${rate}/min`,
+        };
+      })
+      .filter((expert: ExpertProfile) => {
+        if (options.minRate && expert.rate < options.minRate) return false;
+        if (options.maxRate && expert.rate > options.maxRate) return false;
+        return true;
+      });
+
+    for (const expert of normalizedExperts) {
       expert.valueScore = this.calculateValueScore(expert.reviewCount, expert.rating, expert.rate);
     }
 
-    // Enrich top N results with real ratings from profile pages
     let enrichedCount = 0;
     let enrichmentNote: string | undefined;
-    if (options.enrich && options.enrich > 0 && experts.length > 0) {
-      const toEnrich = experts.slice(0, options.enrich);
+    if (options.enrich && options.enrich > 0 && normalizedExperts.length > 0) {
+      const toEnrich = normalizedExperts.slice(0, options.enrich);
       const enrichedExperts = await this.enrichProfiles(toEnrich);
 
-      // Replace enriched experts back into array
       for (let i = 0; i < enrichedExperts.length; i++) {
-        experts[i] = enrichedExperts[i];
+        normalizedExperts[i] = enrichedExperts[i];
       }
 
       enrichedCount = enrichedExperts.filter(e => e.rating !== null).length;
       enrichmentNote = `Enriched ${enrichedCount}/${toEnrich.length} profiles with real ratings`;
 
-      // Re-sort: enriched experts with valueScore first (desc), then unenriched
-      experts.sort((a: ExpertProfile, b: ExpertProfile) => {
+      normalizedExperts.sort((a: ExpertProfile, b: ExpertProfile) => {
         if (a.valueScore !== null && b.valueScore !== null) return b.valueScore - a.valueScore;
         if (a.valueScore !== null) return -1;
         if (b.valueScore !== null) return 1;
@@ -799,8 +763,8 @@ export class ClarityClient {
 
     return {
       success: true,
-      experts,
-      totalResults: experts.length,
+      experts: normalizedExperts,
+      totalResults: normalizedExperts.length,
       page: options.page || 1,
       query: options.query,
       screenshot: screenshotPath,
@@ -809,9 +773,6 @@ export class ClarityClient {
     };
   }
 
-  // ============================================
-  // PUBLIC: View Profile
-  // ============================================
 
   async viewProfile(options: { expert: string }): Promise<any> {
     const page = await this.ensureBrowser();
@@ -824,10 +785,8 @@ export class ClarityClient {
     await page.waitForTimeout(3000);
     await this.dismissCookieBanners(page);
 
-    // Wait for profile content — look for "Request a Call" button or rate info
     try {
       await this.waitForSPAContent(page, 'button, strong', 15000);
-      // Extra wait for SPA hydration
       await page.waitForTimeout(2000);
     } catch {
       const errorScreenshot = `${SCREENSHOT_DIR}/clarity-profile-error-${Date.now()}.png`;
@@ -842,27 +801,22 @@ export class ClarityClient {
     const screenshotPath = `${SCREENSHOT_DIR}/clarity-profile-${username}-${Date.now()}.png`;
     await page.screenshot({ path: screenshotPath, fullPage: true });
 
-    // Extract profile data using text-based parsing (Clarity.fm SPA uses classless DOM)
-    const profile = await page.evaluate((uname: string) => {
+    const profile = await page.evaluate<ExpertProfile, string>((uname: string) => {
       const text = document.body.innerText;
 
-      // Name — extract from page title (format: "Expert Name - Clarity" or "Expertise - Expert Name - Clarity")
       let name = "";
       const title = document.title || "";
       const titleParts = title.split(" - ").filter(p => p.trim() !== "Clarity" && p.trim().length > 0);
       if (titleParts.length >= 2) {
-        // "Expertise Title - Expert Name - Clarity" → take second part
         name = titleParts[1]?.trim() || titleParts[0]?.trim() || "";
       } else if (titleParts.length === 1) {
         name = titleParts[0]?.trim() || "";
       }
 
-      // Fallback: look for <strong> near "Request a Call" button or rate text
       if (!name || name.length < 2) {
         const strongEls = document.querySelectorAll("strong");
         for (const s of Array.from(strongEls)) {
           const sText = s.textContent?.trim() || "";
-          // Skip rates, nav items, short text, and common footer/header strings
           if (!sText.startsWith("$") && sText.length > 3 && !sText.match(/^\d/)
             && !sText.includes("startups") && !sText.includes("Clarity")) {
             name = sText;
@@ -871,12 +825,9 @@ export class ClarityClient {
         }
       }
 
-      // Rate — "$X.XX" pattern in the page
-      const rateMatch = text.match(/\$([\d.]+)\s*(?:per\s*min|\/min)/i);
-      const rateText = rateMatch ? `$${rateMatch[1]}/min` : "";
-      const rate = rateMatch ? parseFloat(rateMatch[1]) : 0;
+      const rateMatch = text.match(/\$\s*[0-9]+(?:\.[0-9]+)?\s*(?:\/\s*min|per\s*(?:min|minute))?/i);
+      const rateText = rateMatch ? rateMatch[0] : "";
 
-      // Rating — look for star pattern, validate 0-5 range
       let rating = 0;
       const ratingMatches = text.matchAll(/([\d.]+)\s*(?:out of 5|stars?|★|\/5)/gi);
       for (const m of ratingMatches) {
@@ -884,15 +835,12 @@ export class ClarityClient {
         if (val > 0 && val <= 5) { rating = val; break; }
       }
 
-      // Call & review counts — "NNN\nCalls" or "NNN\nReviews"
       const callMatch = text.match(/(\d[\d,]*)\s*\n?\s*(?:Calls?|Sessions?|Consultations?)/i);
       const totalCalls = callMatch ? parseInt(callMatch[1].replace(",", "")) : 0;
 
       const reviewMatch = text.match(/(\d[\d,]*)\s*\n?\s*(?:Reviews?|Ratings?|Feedback)/i);
       const reviewCount = reviewMatch ? parseInt(reviewMatch[1].replace(",", "")) : 0;
 
-      // Bio — find the first substantial text block (>100 chars) in the main content,
-      // but skip items from "Similar Experts" section by stopping at certain markers
       let bio = "";
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
       let node: Node | null;
@@ -901,24 +849,21 @@ export class ClarityClient {
         const el = node as HTMLElement;
         const t = el.textContent?.trim() || "";
 
-        // Track when we're past nav into profile content
         if (t.includes("Request a Call") || t.includes("per min")) {
           foundProfileSection = true;
         }
 
-        // Only extract bio from the profile section, not recommended experts
         if (foundProfileSection && el.children.length <= 3) {
           if (t.length > 100 && t.length < 2000 && t.length > bio.length
             && !t.includes("Request a Call") && !t.includes("Clarity")
             && !t.includes("startups.com") && !t.includes("Copyright")) {
             bio = t;
-            break; // Take the first qualifying block after profile section
+            break;
           }
         }
       }
       bio = bio.replace(/\s+/g, " ").trim();
 
-      // Expertise — links to topics or browse categories within main content
       const expertise: string[] = [];
       const allLinks = document.querySelectorAll('a[href*="/topics/"], a[href*="/browse/"]');
       for (const link of Array.from(allLinks)) {
@@ -933,8 +878,8 @@ export class ClarityClient {
         name: name || uname,
         username: uname,
         url: `https://clarity.fm/${uname}`,
-        rate,
-        rateDisplay: rateText || (rate ? `$${rate.toFixed(2)}/min` : "N/A"),
+        rate: 0,
+        rateDisplay: rateText,
         bio: bio.substring(0, 500),
         expertise: [...new Set(expertise)].slice(0, 15),
         totalCalls,
@@ -945,6 +890,9 @@ export class ClarityClient {
       };
     }, username);
 
+    const profileRate = parseClarityRate(profile.rateDisplay || "");
+    profile.rate = profileRate ?? 0;
+    profile.rateDisplay = profileRate === null ? "N/A" : `$${profileRate}/min`;
     profile.valueScore = this.calculateValueScore(profile.reviewCount, profile.rating, profile.rate);
 
     return {
@@ -954,9 +902,6 @@ export class ClarityClient {
     };
   }
 
-  // ============================================
-  // PUBLIC: Compare Experts
-  // ============================================
 
   async compareExperts(options: { experts: string }): Promise<any> {
     const usernames = options.experts.split(",").map(u => u.trim()).filter(Boolean);
@@ -977,7 +922,6 @@ export class ClarityClient {
       screenshots.push(result.screenshot);
     }
 
-    // Find best value (null scores sort last)
     const sorted = [...profiles].sort((a, b) => (b.valueScore ?? -1) - (a.valueScore ?? -1));
     const bestValue = sorted[0];
 
@@ -994,9 +938,6 @@ export class ClarityClient {
     };
   }
 
-  // ============================================
-  // PUBLIC: Fill Booking Form (Stage 1 — no submit)
-  // ============================================
 
   async fillBooking(options: FillBookingOptions): Promise<any> {
     const page = await this.ensureLoggedIn();
@@ -1006,27 +947,30 @@ export class ClarityClient {
     const duration = options.duration || 30;
     const phone = options.phone || this.config.clarity.phone;
 
-    // Navigate to expert profile
     await page.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForTimeout(3000);
     await this.dismissCookieBanners(page);
 
-    // Extract rate for cost estimation
-    const rateText = await page.evaluate(() => {
-      const text = document.body.innerText;
-      const match = text.match(/\$[\d.]+\/min/);
-      return match?.[0] || "";
-    });
-    const costPerMinute = this.parseRate(rateText);
+    const rateText = await page.evaluate(() => document.body.innerText);
+    const parsedRate = parseClarityRate(rateText);
+    if (parsedRate === null || parsedRate <= 0) {
+      const errorScreenshot = `${SCREENSHOT_DIR}/clarity-booking-unknown-cost-${Date.now()}.png`;
+      await page.screenshot({ path: errorScreenshot, fullPage: true });
+      return {
+        error: true,
+        code: "unknown-cost",
+        message: `Could not determine a per-minute rate for "${username}". Refusing to fill booking form without a known cost. See: ${errorScreenshot}`,
+        screenshot: errorScreenshot,
+      };
+    }
+    const costPerMinute = parsedRate;
     const estimatedCost = costPerMinute * duration;
 
-    // Extract expert name
     const expertName = await page.evaluate(() => {
       const el = document.querySelector('h1, [class*="profile-name"], [class*="expert-name"]');
       return el?.textContent?.trim() || "";
     });
 
-    // Click "Request a Call" / "Schedule a Call" button
     const bookingButtonSelectors = [
       'button:has-text("Request a Call")',
       'button:has-text("Schedule a Call")',
@@ -1063,12 +1007,9 @@ export class ClarityClient {
       };
     }
 
-    // Wait for booking form to appear
     await page.waitForTimeout(2000);
 
-    // Fill duration if there's a selector/input
     try {
-      // Try dropdown
       const durationSelect = await page.$('select[name*="duration" i], select[id*="duration" i], select[class*="duration" i]');
       if (durationSelect) {
         await durationSelect.selectOption({ value: String(duration) }).catch(() =>
@@ -1077,13 +1018,11 @@ export class ClarityClient {
           )
         );
       } else {
-        // Try input field
         const durationInput = await page.$('input[name*="duration" i], input[id*="duration" i]');
         if (durationInput) await durationInput.fill(String(duration));
       }
-    } catch { /* duration selector may not exist */ }
+    } catch {   }
 
-    // Fill topic
     if (options.topic) {
       const topicSelectors = [
         'textarea[name*="topic" i]',
@@ -1106,7 +1045,6 @@ export class ClarityClient {
       }
     }
 
-    // Fill phone number
     const phoneSelectors = [
       'input[name*="phone" i]',
       'input[type="tel"]',
@@ -1123,18 +1061,14 @@ export class ClarityClient {
       } catch { continue; }
     }
 
-    // Fill time slots if provided
     const slots = [options.slot1, options.slot2, options.slot3].filter(Boolean);
     if (slots.length > 0) {
-      // Time slots are notoriously hard to automate in SPAs — try multiple approaches
       try {
-        // Approach 1: Direct date/time inputs
         const dateInputs = await page.$$('input[type="datetime-local"], input[type="date"], input[name*="time" i], input[name*="date" i], input[name*="slot" i]');
         for (let i = 0; i < Math.min(slots.length, dateInputs.length); i++) {
           try {
             await dateInputs[i].fill(slots[i]!);
           } catch {
-            // Approach 2: Set value via JS on React-controlled inputs
             await page.evaluate((val: string, idx: number) => {
               const inputs = document.querySelectorAll('input[type="datetime-local"], input[type="date"], input[name*="time"], input[name*="date"], input[name*="slot"]');
               if (inputs[idx]) {
@@ -1146,24 +1080,30 @@ export class ClarityClient {
             }, slots[i]!, i);
           }
         }
-      } catch { /* time slot filling is best-effort */ }
+      } catch {   }
     }
 
-    // Take screenshot of filled form
     const screenshotPath = `${SCREENSHOT_DIR}/clarity-booking-filled-${username}-${Date.now()}.png`;
     await page.screenshot({ path: screenshotPath, fullPage: true });
 
-    this.updateSession({ bookingFilled: true, currentExpert: username });
+    this.updateSession({
+      bookingFilled: true,
+      currentExpert: username,
+      currentDuration: duration,
+      currentCostPerMinute: costPerMinute,
+      currentEstimatedCost: estimatedCost,
+    });
 
-    // Check budget
     let budgetWarning: string | undefined;
     const monthlyBudget = this.config.clarity.monthlyBudget;
-    if (monthlyBudget && estimatedCost > 0) {
-      // Budget tracking is done by the budget-tracker module
-      // We just report estimated cost here for the agent to check
-      budgetWarning = estimatedCost > monthlyBudget
-        ? `WARNING: Estimated cost $${estimatedCost.toFixed(2)} exceeds monthly budget of $${monthlyBudget}`
-        : undefined;
+    const budgetStatus = this.budgetTracker.getStatus();
+    if (estimatedCost > 0 && budgetStatus.monthlyCap > 0 && this.budgetTracker.isOverBudget(estimatedCost)) {
+      budgetWarning =
+        `WARNING: Estimated cost $${estimatedCost.toFixed(2)} would exceed remaining monthly budget ` +
+        `(spent $${budgetStatus.spent.toFixed(2)} of $${budgetStatus.monthlyCap.toFixed(2)}, ` +
+        `remaining $${budgetStatus.remaining.toFixed(2)})`;
+    } else if (monthlyBudget && estimatedCost > monthlyBudget) {
+      budgetWarning = `WARNING: Estimated cost $${estimatedCost.toFixed(2)} exceeds monthly budget of $${monthlyBudget}`;
     }
 
     return {
@@ -1176,122 +1116,21 @@ export class ClarityClient {
       duration,
       topic: options.topic,
       budgetWarning,
-      message: "Booking form filled. Review the screenshot before confirming. DO NOT call submit-booking without user approval.",
+      message: "Booking preview created. Review the screenshot, then recreate and submit the booking manually in your own Clarity browser. The CLI will not submit or record the spend automatically.",
     };
   }
 
-  // ============================================
-  // PUBLIC: Submit Booking (Stage 2)
-  // ============================================
 
   async submitBooking(): Promise<any> {
-    const session = this.getSession();
-    if (!session?.bookingFilled) {
-      return {
-        error: true,
-        message: "No booking form has been filled. Call fill-booking first.",
-      };
-    }
-
-    const page = await this.ensureBrowser();
-
-    try {
-      // Find and click the submit/confirm button
-      const submitSelectors = [
-        'button:has-text("Request Call")',
-        'button:has-text("Confirm")',
-        'button:has-text("Submit")',
-        'button:has-text("Book")',
-        'button:has-text("Send Request")',
-        'button[type="submit"]',
-        '[class*="submit-button"]',
-        '[class*="confirm-button"]',
-      ];
-
-      let submitted = false;
-      for (const selector of submitSelectors) {
-        try {
-          const btn = await page.$(selector);
-          if (btn && await btn.isVisible()) {
-            await btn.click({ force: true });
-            submitted = true;
-            break;
-          }
-        } catch { continue; }
-      }
-
-      if (!submitted) {
-        const errorScreenshot = `${SCREENSHOT_DIR}/clarity-submit-no-button-${Date.now()}.png`;
-        await page.screenshot({ path: errorScreenshot, fullPage: true });
-        return {
-          error: true,
-          message: `Could not find submit button. The user may need to click submit manually in the headed browser. See: ${errorScreenshot}`,
-          screenshot: errorScreenshot,
-        };
-      }
-
-      // Wait for confirmation / payment step
-      await page.waitForTimeout(5000);
-
-      // Check for payment confirmation
-      const paymentIndicators = await page.$('[class*="payment"], [class*="stripe"], [class*="credit-card"], iframe[src*="stripe"]');
-      if (paymentIndicators) {
-        // Payment flow detected — screenshot and defer to user
-        const paymentScreenshot = `${SCREENSHOT_DIR}/clarity-payment-step-${Date.now()}.png`;
-        await page.screenshot({ path: paymentScreenshot, fullPage: true });
-        return {
-          error: true,
-          message: "Payment confirmation step detected. Please complete payment manually in the browser window. DO NOT retry automatically.",
-          screenshot: paymentScreenshot,
-          requiresManualPayment: true,
-        };
-      }
-
-      const confirmScreenshot = `${SCREENSHOT_DIR}/clarity-booking-confirmed-${Date.now()}.png`;
-      await page.screenshot({ path: confirmScreenshot, fullPage: true });
-
-      // Extract confirmation data
-      const confirmation = await page.evaluate(() => {
-        const text = document.body.innerText;
-
-        const callIdMatch = text.match(/(?:Call|Request|Booking)\s*(?:#|ID|Number)[:\s]*([A-Za-z0-9-]+)/i);
-        const timeMatch = text.match(/(?:Scheduled|Time|Date)[:\s]*([^\n]+)/i);
-        const dialMatch = text.match(/(?:Dial|Call|Phone)[:\s]*([+\d()\s-]+)/);
-        const costMatch = text.match(/(?:Total|Cost|Charge|Amount)[:\s]*\$?([\d.]+)/i);
-
-        return {
-          clarityCallId: callIdMatch?.[1] || null,
-          scheduledAt: timeMatch?.[1]?.trim() || null,
-          dialInNumber: dialMatch?.[1]?.trim() || null,
-          estimatedTotal: costMatch ? parseFloat(costMatch[1]) : null,
-          pageText: text.substring(0, 2000),
-        };
-      });
-
-      await this.saveStorageState();
-      this.updateSession({ bookingFilled: false });
-
-      return {
-        success: true,
-        screenshot: confirmScreenshot,
-        confirmation,
-        expert: session.currentExpert,
-        message: "Booking submitted successfully.",
-      };
-    } catch (error: any) {
-      const errorScreenshot = `${SCREENSHOT_DIR}/clarity-submit-error-${Date.now()}.png`;
-      await page.screenshot({ path: errorScreenshot, fullPage: true }).catch(() => {});
-      return {
-        error: true,
-        message: `Submit failed: ${error.message}. DO NOT retry — risk of double charge.`,
-        screenshot: errorScreenshot,
-      };
-    }
+    return {
+      error: true,
+      code: "manual-submit-required",
+      requiresManualSubmission: true,
+      message:
+        "Automated Clarity submission is disabled because the CLI cannot reconnect to the exact filled form safely. Submit manually in Clarity and record the confirmed spend separately.",
+    };
   }
 
-  // ============================================
-  // PUBLIC: List Calls
-  // ============================================
 
   async listCalls(options: { status?: string }): Promise<any> {
     const page = await this.ensureLoggedIn();
@@ -1300,10 +1139,9 @@ export class ClarityClient {
     await page.waitForTimeout(3000);
     await this.dismissCookieBanners(page);
 
-    // Wait for dashboard content
     try {
       await this.waitForSPAContent(page, '[class*="call"], [class*="booking"], [class*="dashboard"]', 15000);
-    } catch { /* dashboard may have no calls */ }
+    } catch {   }
 
     const screenshotPath = `${SCREENSHOT_DIR}/clarity-dashboard-${Date.now()}.png`;
     await page.screenshot({ path: screenshotPath, fullPage: true });
@@ -1313,7 +1151,6 @@ export class ClarityClient {
     const calls = await page.evaluate((filter: string) => {
       const results: any[] = [];
 
-      // Find call/booking entries
       const entrySelectors = [
         '[class*="call-item"]',
         '[class*="booking-item"]',
@@ -1334,27 +1171,21 @@ export class ClarityClient {
         try {
           const text = entry.textContent || "";
 
-          // Extract expert name
           const nameEl = entry.querySelector('[class*="name"], [class*="expert"], a[href^="/"]');
           const expertName = nameEl?.textContent?.trim() || "";
 
-          // Extract date
           const dateMatch = text.match(/(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\w+ \d{1,2},? \d{4})/);
           const date = dateMatch?.[1] || "";
 
-          // Extract duration
           const durationMatch = text.match(/(\d+)\s*min/i);
           const duration = durationMatch?.[1] ? `${durationMatch[1]} min` : "";
 
-          // Extract cost
           const costMatch = text.match(/\$[\d.]+/);
           const cost = costMatch?.[0] || "";
 
-          // Extract status
           const statusEl = entry.querySelector('[class*="status"], [class*="badge"]');
           const status = statusEl?.textContent?.trim()?.toLowerCase() || "";
 
-          // Extract topic
           const topicEl = entry.querySelector('[class*="topic"], [class*="subject"]');
           const topic = topicEl?.textContent?.trim() || "";
 
@@ -1368,7 +1199,7 @@ export class ClarityClient {
               results.push(callEntry);
             }
           }
-        } catch { /* skip */ }
+        } catch {   }
       }
 
       return results;
@@ -1383,9 +1214,6 @@ export class ClarityClient {
     };
   }
 
-  // ============================================
-  // PUBLIC: Screenshot
-  // ============================================
 
   async takeScreenshot(options?: ScreenshotOptions): Promise<any> {
     const page = await this.ensureBrowser();
@@ -1404,9 +1232,6 @@ export class ClarityClient {
     };
   }
 
-  // ============================================
-  // PUBLIC: Reset
-  // ============================================
 
   async reset(): Promise<any> {
     try {

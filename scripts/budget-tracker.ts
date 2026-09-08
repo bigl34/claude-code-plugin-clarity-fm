@@ -1,18 +1,77 @@
-/**
- * Clarity.fm Budget Tracker
- *
- * Local JSON-based monthly spend tracking. Prevents accidental overspend
- * by checking estimated costs against a user-configurable monthly cap.
- *
- * Data stored at ~/.cache/clarity-fm-manager/budget.json
- */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  copyFileSync,
+  existsSync,
+  fsyncSync,
+  linkSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "fs";
+import { randomUUID } from "node:crypto";
 import { join } from "path";
 import { homedir } from "os";
 
-const BUDGET_DIR = join(homedir(), ".cache", "clarity-fm-manager");
-const BUDGET_PATH = join(BUDGET_DIR, "budget.json");
+export function resolveBudgetPaths(
+  env: NodeJS.ProcessEnv = process.env,
+  home = homedir(),
+): { directory: string; path: string; legacyPath: string } {
+  const directory = env.CLARITY_FM_STATE_DIR
+    || join(env.BIZ_ROOT || join(home, "biz"), "var", "clarity-fm-manager"); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  return {
+    directory,
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+    path: join(directory, "budget.json"),
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+    legacyPath: join(home, ".cache", "clarity-fm-manager", "budget.json"),
+  };
+}
+
+const BUDGET_PATHS = resolveBudgetPaths();
+
+type BudgetPaths = ReturnType<typeof resolveBudgetPaths>;
+
+function ensurePrivateDirectory(paths: BudgetPaths = BUDGET_PATHS): void {
+  mkdirSync(paths.directory, { recursive: true, mode: 0o700 });
+  chmodSync(paths.directory, 0o700);
+}
+
+export function migrateLegacyBudget(paths: BudgetPaths = BUDGET_PATHS): void {
+  if (existsSync(paths.path) || !existsSync(paths.legacyPath)) return;
+  ensurePrivateDirectory(paths);
+  const temporaryPath = `${paths.path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    copyFileSync(
+      paths.legacyPath,
+      temporaryPath,
+      constants.COPYFILE_EXCL,
+    );
+    chmodSync(temporaryPath, 0o600);
+    JSON.parse(readFileSync(temporaryPath, "utf8"));
+    const fileDescriptor = openSync(temporaryPath, "r");
+    try {
+      fsyncSync(fileDescriptor);
+    } finally {
+      closeSync(fileDescriptor);
+    }
+    try {
+      linkSync(temporaryPath, paths.path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  } finally {
+    try {
+      unlinkSync(temporaryPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+}
 
 interface BudgetEntry {
   date: string;
@@ -24,7 +83,7 @@ interface BudgetEntry {
 
 interface BudgetData {
   monthlyCap: number;
-  entries: Record<string, BudgetEntry[]>; // keyed by YYYY-MM
+  entries: Record<string, BudgetEntry[]>;
 }
 
 export class BudgetTracker {
@@ -35,12 +94,11 @@ export class BudgetTracker {
   }
 
   private load(): BudgetData {
-    if (!existsSync(BUDGET_DIR)) {
-      mkdirSync(BUDGET_DIR, { recursive: true });
-    }
-    if (existsSync(BUDGET_PATH)) {
+    migrateLegacyBudget();
+    ensurePrivateDirectory();
+    if (existsSync(BUDGET_PATHS.path)) {
       try {
-        return JSON.parse(readFileSync(BUDGET_PATH, "utf-8"));
+        return JSON.parse(readFileSync(BUDGET_PATHS.path, "utf-8"));
       } catch {
         return { monthlyCap: 0, entries: {} };
       }
@@ -49,14 +107,16 @@ export class BudgetTracker {
   }
 
   private save(): void {
-    if (!existsSync(BUDGET_DIR)) {
-      mkdirSync(BUDGET_DIR, { recursive: true });
-    }
-    writeFileSync(BUDGET_PATH, JSON.stringify(this.data, null, 2));
+    ensurePrivateDirectory();
+    writeFileSync(BUDGET_PATHS.path, JSON.stringify(this.data, null, 2), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    chmodSync(BUDGET_PATHS.path, 0o600);
   }
 
   private currentMonth(): string {
-    return new Date().toISOString().slice(0, 7); // YYYY-MM
+    return new Date().toISOString().slice(0, 7);
   }
 
   setBudget(monthly: number): { success: boolean; monthlyCap: number; message: string } {
@@ -119,3 +179,4 @@ export class BudgetTracker {
     };
   }
 }
+

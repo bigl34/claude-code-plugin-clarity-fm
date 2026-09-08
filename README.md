@@ -3,7 +3,7 @@
 
 Find and book expert calls on Clarity.fm via CLI-based browser automation (zero context overhead)
 
-![Version](https://img.shields.io/badge/version-1.3.0-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
+![Version](https://img.shields.io/badge/version-1.3.1-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-green) ![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)
 
 ## Features
 
@@ -11,7 +11,7 @@ Find and book expert calls on Clarity.fm via CLI-based browser automation (zero 
 - **view-profile** — Extract detailed expert profile data
 - **compare-experts** — Side-by-side comparison of 2-3 experts
 - **fill-booking** — Fill booking form (does NOT submit)
-- **submit-booking** — Submit after user confirmation
+- **submit-booking** — Compatibility refusal; submission stays manual
 - **list-calls** — View calls from dashboard
 - **budget-status** — Show monthly spend and remaining budget
 - **set-budget** — Set monthly spending cap (USD)
@@ -30,11 +30,11 @@ Find and book expert calls on Clarity.fm via CLI-based browser automation (zero 
 git clone https://github.com/bigl34/claude-code-plugin-clarity-fm.git
 cd claude-code-plugin-clarity-fm
 cp config.template.json config.json  # fill in your credentials
-cd scripts && npm install
+npm --prefix scripts install
 ```
 
 ```bash
-node scripts/dist/cli.js search-experts
+npm --prefix scripts run cli -- search-experts
 ```
 
 ## Installation
@@ -50,18 +50,18 @@ node scripts/dist/cli.js search-experts
 
 ### Available CLI Commands
 
-| Command           | Purpose                                  | Type            |
-| ----------------- | ---------------------------------------- | --------------- |
-| `search-experts`  | Search by keyword with rate/sort filters | Read            |
-| `view-profile`    | Extract detailed expert profile data     | Read            |
-| `compare-experts` | Side-by-side comparison of 2-3 experts   | Read            |
-| `fill-booking`    | Fill booking form (does NOT submit)      | Write (safe)    |
-| `submit-booking`  | Submit after user confirmation           | Write (payment) |
-| `list-calls`      | View calls from dashboard                | Read            |
-| `budget-status`   | Show monthly spend and remaining budget  | Local           |
-| `set-budget`      | Set monthly spending cap (USD)           | Local           |
-| `screenshot`      | Take screenshot of current page          | Utility         |
-| `reset`           | Close browser and clear session          | Utility         |
+| Command           | Purpose                                        | Type         |
+| ----------------- | ---------------------------------------------- | ------------ |
+| `search-experts`  | Search by keyword with rate/sort filters       | Read         |
+| `view-profile`    | Extract detailed expert profile data           | Read         |
+| `compare-experts` | Side-by-side comparison of 2-3 experts         | Read         |
+| `fill-booking`    | Fill booking form (does NOT submit)            | Write (safe) |
+| `submit-booking`  | Compatibility refusal; submission stays manual | No action    |
+| `list-calls`      | View calls from dashboard                      | Read         |
+| `budget-status`   | Show monthly spend and remaining budget        | Local        |
+| `set-budget`      | Set monthly spending cap (USD)                 | Local        |
+| `screenshot`      | Take screenshot of current page                | Utility      |
+| `reset`           | Close browser and clear session                | Utility      |
 
 ### search-experts Options
 
@@ -120,15 +120,15 @@ node scripts/dist/cli.js search-experts
 ## Usage Examples
 
 ```bash
-node scripts/dist/cli.js compare-experts --experts "alice,bob,carol"
+npm --prefix scripts run cli -- compare-experts --experts "alice,bob,carol"
 ```
 
 ```bash
-node scripts/dist/cli.js budget-status
+npm --prefix scripts run cli -- budget-status
 ```
 
 ```bash
-node scripts/dist/cli.js set-budget --monthly 200
+npm --prefix scripts run cli -- set-budget --monthly 200
 ```
 
 ## How It Works
